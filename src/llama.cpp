@@ -497,6 +497,11 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
+    if (model->has_stage()) {
+        LLAMA_LOG_ERROR("%s: cannot save a partial decoder stage as a complete GGUF model\n", __func__);
+        return;
+    }
+
     llama_model_saver ms(model);
     ms.add_kv_from_model();
     ms.add_tensors_from_model();
@@ -618,4 +623,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

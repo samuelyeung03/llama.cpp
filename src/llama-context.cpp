@@ -942,6 +942,10 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 }
 
 float * llama_context::get_logits_ith(int32_t i) {
+    if (model.has_stage() && model.stage_layer_end() < model.hparams.n_layer()) {
+        return nullptr;
+    }
+
     output_reorder();
 
     try {
@@ -1718,6 +1722,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    if (model.has_stage()) {
+        const bool suffix = model.stage_layer_start() > 0;
+        for (const auto & token : batch_inp.tokens) {
+            if (suffix ? (!token.has_embd || token.id != LLAMA_TOKEN_NULL) : (token.has_embd || token.id == LLAMA_TOKEN_NULL)) {
+                LLAMA_LOG_ERROR("%s: Qwen3.5 prefix needs token IDs and suffix needs hidden-state embeddings\n", __func__);
+                return -1;
+            }
+        }
+    }
+
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
@@ -2112,7 +2126,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !(model.has_stage() && model.stage_layer_end() < hparams.n_layer());
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -3759,6 +3773,17 @@ llama_context * llama_init_from_model(
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
+    }
+
+    if (model->has_stage()) {
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            LLAMA_LOG_ERROR("%s: Qwen3.5 decoder stages require a default context\n", __func__);
+            return nullptr;
+        }
+        if (model->stage_layer_start() == 0) {
+            params.embeddings = true;
+            params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        }
     }
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {

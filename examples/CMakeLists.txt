@@ -10,6 +10,14 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
+option(LLAMA_BUILD_SPLIT_LOOKAHEAD "llama: build experimental two-host Qwen3.5 lookahead" OFF)
+if (LLAMA_BUILD_SPLIT_LOOKAHEAD)
+    if (NOT UNIX OR EMSCRIPTEN)
+        message(FATAL_ERROR "split-lookahead currently requires POSIX sockets")
+    endif()
+    add_subdirectory(split-lookahead)
+endif()
+
 # examples
 
 if (EMSCRIPTEN)

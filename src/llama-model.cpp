@@ -1474,6 +1474,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    if (has_stage() && (arch != LLM_ARCH_QWEN35 || hparams.n_expert != 0 || hparams.n_layer_nextn != 0 ||
+                        stage_layer_start() >= stage_layer_end() || stage_layer_end() > hparams.n_layer() ||
+                        (stage_layer_start() != 0 && stage_layer_end() != hparams.n_layer()))) {
+        throw std::runtime_error("decoder stages require a dense Qwen3.5 prefix [0, split) or suffix [split, n_layer)");
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1780,7 +1786,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(has_stage());
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -2642,10 +2648,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                         filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                            return il >= stage_layer_start() && il < stage_layer_end() && !hparams.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                            return il >= stage_layer_start() && il < stage_layer_end() && hparams.is_recr(il);
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
@@ -2870,6 +2876,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.stage_layer_start           =*/ 0,
+        /*.stage_layer_end             =*/ 0,
     };
 
     return result;

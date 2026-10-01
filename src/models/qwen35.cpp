@@ -33,18 +33,23 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
+    const bool stage_prefix = has_stage() && stage_layer_end() < hparams.n_layer();
+    const bool stage_suffix = has_stage() && stage_layer_start() > 0;
+    const bool output_tied = ml.get_weight("output.weight") == nullptr;
+    const int skipped = TENSOR_SKIP | TENSOR_NOT_REQUIRED;
+
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, stage_suffix && !output_tied ? skipped : 0);
 
     // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, stage_prefix ? skipped : 0);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, stage_prefix ? skipped : TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    if (output == NULL && !stage_prefix) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -74,8 +79,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
-            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
-            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, flags | TENSOR_NOT_REQUIRED);
+            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, flags | TENSOR_NOT_REQUIRED);
             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
@@ -116,7 +121,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     };
 
     for (int i = 0; i < n_layer; ++i) {
-        load_block_trunk(i, trunk_flags);
+        load_block_trunk(i, i < (int) stage_layer_start() || i >= (int) stage_layer_end() ? skipped : trunk_flags);
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
@@ -152,7 +157,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = (int) model.stage_layer_start(); il < (int) model.stage_layer_end(); ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -202,6 +207,16 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    if (model.has_stage() && model.stage_layer_end() < hparams.n_layer()) {
+        res->t_layer_inp[model.stage_layer_end()] = cur;
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
