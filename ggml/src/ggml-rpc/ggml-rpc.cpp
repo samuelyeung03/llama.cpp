@@ -1155,6 +1155,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
+    static std::mutex profile_graph_mutex;
+    static std::unordered_map<std::string, uint64_t> profile_graph_ordinals;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
@@ -1168,6 +1170,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
         rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+    }
+    if (ggml_stage_profile::enabled()) {
+        uint64_t ordinal;
+        {
+            std::lock_guard<std::mutex> lock(profile_graph_mutex);
+            ordinal = ++profile_graph_ordinals[rpc_dev_ctx->endpoint];
+        }
+        std::ostringstream fields;
+        fields << "\"endpoint\":" << ggml_stage_profile::quote(rpc_dev_ctx->endpoint.c_str())
+               << ",\"ordinal\":" << ordinal
+               << ",\"device\":" << rpc_ctx->device
+               << ",\"graph_nodes\":" << cgraph->n_nodes
+               << ",\"command\":" << ggml_stage_profile::quote(
+                    reuse ? "graph_recompute" : "graph_compute")
+               << ",\"submitted_to_dispatcher\":true";
+        ggml_stage_profile::emit("rpc_client_graph_submit", fields.str());
     }
     return GGML_STATUS_SUCCESS;
 }

@@ -12,7 +12,9 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "../ggml/src/ggml-stage-profile.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1394,9 +1396,37 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static std::atomic<uint64_t> profile_ubatch_sequence{0};
+    const bool profile = ggml_stage_profile::enabled();
+    const uint64_t ubatch_id = profile ? ++profile_ubatch_sequence : 0;
+    const uint64_t profile_start = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    if (profile) {
+        uint32_t n_outputs = 0;
+        if (ubatch.output != nullptr) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                n_outputs += ubatch.output[i] != 0;
+            }
+        }
+        std::ostringstream fields;
+        fields << "\"ubatch_id\":" << ubatch_id
+               << ",\"n_tokens\":" << ubatch.n_tokens
+               << ",\"n_outputs\":" << n_outputs
+               << ",\"graph_type\":" << static_cast<int>(gtype);
+        ggml_stage_profile::emit("llama_ubatch_begin", fields.str());
+    }
+    auto emit_end = [&](ggml_status status) {
+        if (profile) {
+            std::ostringstream fields;
+            fields << "\"ubatch_id\":" << ubatch_id
+                   << ",\"status\":" << static_cast<int>(status)
+                   << ",\"host_wall_ns\":" << ggml_stage_profile::monotonic_ns() - profile_start;
+            ggml_stage_profile::emit("llama_ubatch_end", fields.str());
+        }
+    };
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
+        emit_end(ret);
         return nullptr;
     }
 
@@ -1434,12 +1464,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
+            emit_end(ret);
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
+            emit_end(ret);
             return nullptr;
         }
 
@@ -1460,10 +1492,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        emit_end(ret);
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
+    emit_end(ret);
 
     return res;
 }
