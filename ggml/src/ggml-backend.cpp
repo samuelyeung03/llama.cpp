@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-stage-profile.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -20,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -1652,11 +1654,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
+    static std::atomic<uint64_t> profile_sequence{0};
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool profile = ggml_stage_profile::enabled();
+        const uint64_t sequence = profile ? ++profile_sequence : 0;
+        const uint64_t split_start_ns = profile ? ggml_stage_profile::monotonic_ns() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1667,12 +1673,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
+        const uint64_t copies_start_ns = profile ? ggml_stage_profile::monotonic_ns() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            const uint64_t input_start_ns = profile ? ggml_stage_profile::monotonic_ns() : 0;
+            size_t sparse_expert_bytes = 0;
+            auto emit_input_copy = [&] {
+                if (!profile) {
+                    return;
+                }
+                std::ostringstream fields;
+                fields << "\"sequence\":" << sequence
+                       << ",\"split_index\":" << split_id
+                       << ",\"input_index\":" << input_id
+                       << ",\"source_backend\":" << ggml_stage_profile::quote(
+                            input_backend ? ggml_backend_name(input_backend) : "host_or_unassigned")
+                       << ",\"destination_backend\":" << ggml_stage_profile::quote(ggml_backend_name(split_backend))
+                       << ",\"tensor\":" << ggml_stage_profile::quote(input->name)
+                       << ",\"scheduled_tensor_bytes\":" << ggml_nbytes(input)
+                       << ",\"sparse_expert_copy_bytes\":" << sparse_expert_bytes
+                       << ",\"host_wall_ns\":" << ggml_stage_profile::monotonic_ns() - input_start_ns
+                       << ",\"actual_wire_bytes_known\":false";
+                ggml_stage_profile::emit("scheduler_input_copy", fields.str());
+            };
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1709,6 +1736,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_t ids_backend = split_backend;
 
                     if (ggml_nelements(ids_tensor) == 0) {
+                        emit_input_copy();
                         continue;
                     }
 
@@ -1747,6 +1775,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        sparse_expert_bytes += expert_size_copy + padding_end;
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -1793,7 +1822,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+            emit_input_copy();
         }
+        const uint64_t graph_start_ns = profile ? ggml_stage_profile::monotonic_ns() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1837,6 +1868,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+        if (profile) {
+            std::ostringstream fields;
+            fields << "\"sequence\":" << sequence
+                   << ",\"split_index\":" << split_id
+                   << ",\"backend\":" << ggml_stage_profile::quote(ggml_backend_name(split_backend))
+                   << ",\"graph_nodes\":" << split->graph.n_nodes
+                   << ",\"input_count\":" << split->n_inputs
+                   << ",\"previous_split_wait_wall_ns\":" << copies_start_ns - split_start_ns
+                   << ",\"copy_and_destination_wait_wall_ns\":" << graph_start_ns - copies_start_ns
+                   << ",\"graph_submit_or_callback_wall_ns\":" << ggml_stage_profile::monotonic_ns() - graph_start_ns
+                   << ",\"gpu_event_time_in_this_record\":false";
+            ggml_stage_profile::emit("scheduler_split", fields.str());
         }
 
         prev_backend_id = split_backend_id;

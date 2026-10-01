@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "../ggml-stage-profile.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -2432,8 +2433,38 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+static void ggml_cuda_stage_profile_flush(ggml_backend_cuda_context * cuda_ctx, bool wait_for_events) {
+    if (cuda_ctx->stage_profile_pending.empty()) {
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    for (const auto & item : cuda_ctx->stage_profile_pending) {
+        if (wait_for_events) {
+            CUDA_CHECK(cudaEventSynchronize(item.end));
+        }
+        float stream_elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&stream_elapsed_ms, item.start, item.end));
+        std::ostringstream fields;
+        fields << "\"device\":" << cuda_ctx->device
+               << ",\"backend\":" << ggml_stage_profile::quote(cuda_ctx->name.c_str())
+               << ",\"sequence\":" << item.sequence
+               << ",\"graph_nodes\":" << item.graph_nodes
+               << ",\"stream_elapsed_ms\":" << stream_elapsed_ms
+               << ",\"timing_scope\":\"main_stream_elapsed_including_dispatch_gaps_not_kernel_busy\""
+               << ",\"extra_sync_for_profile\":" << (wait_for_events ? "true" : "false");
+        ggml_stage_profile::emit("cuda_graph_stream_elapsed", fields.str());
+        CUDA_CHECK(cudaEventDestroy(item.start));
+        CUDA_CHECK(cudaEventDestroy(item.end));
+    }
+    cuda_ctx->stage_profile_pending.clear();
+}
+
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    // Normally drained by an existing backend synchronize. Only final teardown
+    // may need an extra wait to avoid discarding a queued timing record.
+    ggml_cuda_stage_profile_flush(cuda_ctx, true);
 
     delete cuda_ctx;
     delete backend;
@@ -2542,6 +2573,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    ggml_cuda_stage_profile_flush(cuda_ctx, false);
 
     GGML_UNUSED(backend);
 }
@@ -4477,6 +4509,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    const bool profile = ggml_stage_profile::enabled();
+    const bool profile_events = profile && !(use_cuda_graph && cuda_graph_update_required);
+    const uint64_t profile_start_ns = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    ggml_backend_cuda_context::stage_profile_event profile_event;
+    if (profile_events) {
+        profile_event.sequence = ++cuda_ctx->stage_profile_sequence;
+        profile_event.graph_nodes = cgraph->n_nodes;
+        CUDA_CHECK(cudaEventCreate(&profile_event.start));
+        CUDA_CHECK(cudaEventCreate(&profile_event.end));
+        CUDA_CHECK(cudaEventRecord(profile_event.start, cuda_ctx->stream()));
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4488,6 +4532,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (profile_events) {
+        CUDA_CHECK(cudaEventRecord(profile_event.end, cuda_ctx->stream()));
+        cuda_ctx->stage_profile_pending.push_back(profile_event);
+    }
+    if (profile) {
+        std::ostringstream fields;
+        fields << "\"device\":" << cuda_ctx->device
+               << ",\"backend\":" << ggml_stage_profile::quote(cuda_ctx->name.c_str())
+               << ",\"graph_nodes\":" << cgraph->n_nodes
+               << ",\"sequence\":" << profile_event.sequence
+               << ",\"host_submit_wall_ns\":" << ggml_stage_profile::monotonic_ns() - profile_start_ns
+               << ",\"gpu_event_status\":" << ggml_stage_profile::quote(
+                    profile_events ? "pending_existing_synchronize" : "skipped_cuda_graph_capture")
+               << ",\"gpu_event_time_in_this_record\":false";
+        ggml_stage_profile::emit("cuda_graph_submit", fields.str());
+    }
 
     return GGML_STATUS_SUCCESS;
 }

@@ -1448,6 +1448,15 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    struct stage_profile_event {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t end = nullptr;
+        uint64_t sequence = 0;
+        int graph_nodes = 0;
+    };
+    std::vector<stage_profile_event> stage_profile_pending;
+    uint64_t stage_profile_sequence = 0;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

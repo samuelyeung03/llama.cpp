@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "../ggml-stage-profile.h"
 #include "transport.h"
 
 #include <array>
@@ -719,6 +720,9 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    const bool profile_activation = ggml_stage_profile::enabled() &&
+        buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    const uint64_t profile_start = profile_activation ? ggml_stage_profile::monotonic_ns() : 0;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     uint8_t cache_flag = 0;
     if (rpc_use_hash_cache(tensor, size)) {
@@ -738,15 +742,38 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     size_t input_size;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    if (profile_activation) {
+        auto * type_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
+        std::ostringstream fields;
+        fields << "\"endpoint\":" << ggml_stage_profile::quote(type_ctx->endpoint.c_str())
+               << ",\"direction\":\"coordinator_to_worker\""
+               << ",\"payload_bytes\":" << size
+               << ",\"host_wall_ns\":" << ggml_stage_profile::monotonic_ns() - profile_start
+               << ",\"includes_dispatch_and_wire_wait\":true";
+        ggml_stage_profile::emit("rpc_client_activation_set", fields.str());
+    }
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    const bool profile_activation = ggml_stage_profile::enabled() &&
+        buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    const uint64_t profile_start = profile_activation ? ggml_stage_profile::monotonic_ns() : 0;
     auto request = std::make_shared<rpc_msg_get_tensor_req>();
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
     ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+    if (profile_activation) {
+        auto * type_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
+        std::ostringstream fields;
+        fields << "\"endpoint\":" << ggml_stage_profile::quote(type_ctx->endpoint.c_str())
+               << ",\"direction\":\"worker_to_coordinator\""
+               << ",\"payload_bytes\":" << size
+               << ",\"host_wall_ns\":" << ggml_stage_profile::monotonic_ns() - profile_start
+               << ",\"includes_dispatch_and_wire_wait\":true";
+        ggml_stage_profile::emit("rpc_client_activation_get", fields.str());
+    }
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -1476,7 +1503,18 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
+    const bool profile_activation = ggml_stage_profile::enabled() &&
+        tensor->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    const uint64_t transfer_start = profile_activation ? ggml_stage_profile::monotonic_ns() : 0;
     ggml_backend_tensor_set(tensor, data, offset, size);
+    if (profile_activation) {
+        std::ostringstream fields;
+        fields << "\"direction\":\"host_to_worker_device\""
+               << ",\"payload_bytes\":" << size
+               << ",\"backend_copy_wall_ns\":" << ggml_stage_profile::monotonic_ns() - transfer_start
+               << ",\"gpu_event_time_in_this_record\":false";
+        ggml_stage_profile::emit("rpc_worker_activation_set", fields.str());
+    }
     return true;
 }
 
@@ -1608,7 +1646,18 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
 
     response.resize(request.size, 0);
+    const bool profile_activation = ggml_stage_profile::enabled() &&
+        tensor->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    const uint64_t transfer_start = profile_activation ? ggml_stage_profile::monotonic_ns() : 0;
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    if (profile_activation) {
+        std::ostringstream fields;
+        fields << "\"direction\":\"worker_device_to_host\""
+               << ",\"payload_bytes\":" << request.size
+               << ",\"backend_copy_wall_ns\":" << ggml_stage_profile::monotonic_ns() - transfer_start
+               << ",\"gpu_event_time_in_this_record\":false";
+        ggml_stage_profile::emit("rpc_worker_activation_get", fields.str());
+    }
     return true;
 }
 
@@ -1710,6 +1759,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    const bool profile = ggml_stage_profile::enabled();
+    const uint64_t profile_start = profile ? ggml_stage_profile::monotonic_ns() : 0;
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t)) {
@@ -1776,13 +1827,27 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
+    const uint64_t compute_start = profile ? ggml_stage_profile::monotonic_ns() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    if (profile) {
+        std::ostringstream fields;
+        fields << "\"device\":" << device
+               << ",\"backend\":" << ggml_stage_profile::quote(ggml_backend_name(backends[device]))
+               << ",\"graph_nodes\":" << n_nodes
+               << ",\"serialized_graph_bytes\":" << input.size()
+               << ",\"deserialize_wall_ns\":" << compute_start - profile_start
+               << ",\"compute_and_sync_wall_ns\":" << ggml_stage_profile::monotonic_ns() - compute_start
+               << ",\"gpu_event_time_in_this_record\":false";
+        ggml_stage_profile::emit("rpc_worker_graph", fields.str());
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
     return true;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    const bool profile = ggml_stage_profile::enabled();
+    const uint64_t profile_start = profile ? ggml_stage_profile::monotonic_ns() : 0;
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -1793,6 +1858,15 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    if (profile) {
+        std::ostringstream fields;
+        fields << "\"device\":" << device
+               << ",\"backend\":" << ggml_stage_profile::quote(ggml_backend_name(backends[device]))
+               << ",\"graph_nodes\":" << graph->n_nodes
+               << ",\"compute_and_sync_wall_ns\":" << ggml_stage_profile::monotonic_ns() - profile_start
+               << ",\"gpu_event_time_in_this_record\":false";
+        ggml_stage_profile::emit("rpc_worker_graph_recompute", fields.str());
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
