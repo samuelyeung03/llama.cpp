@@ -22,6 +22,7 @@ struct socket_t {
 #ifdef GGML_RPC_QUIC
     void close(); // Cancels blocked QUIC accept/send/receive for owned shutdown.
     bool drain_acked(); // Bounded wait for queued data and QUIC retransmission backlog.
+    bool wait_readable(); // Between complete RPC messages only; payload reads remain timed.
 #endif
 
     socket_ptr accept();
