@@ -4,6 +4,9 @@
 #include "ggml-cpp.h"
 #include "../ggml-stage-profile.h"
 #include "transport.h"
+#ifdef GGML_RPC_QUIC
+#include "peer-exports.h"
+#endif
 
 #include <array>
 #include <cinttypes>
@@ -79,6 +82,8 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_NONE,
+    RPC_CMD_PEER_EXPORT,
+    RPC_CMD_PEER_PULL,
     RPC_CMD_COUNT,
 };
 
@@ -205,7 +210,24 @@ struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
 
+#ifdef GGML_RPC_QUIC
+struct rpc_msg_peer_export_req { rpc_tensor tensor; };
+struct rpc_msg_peer_export_rsp { uint8_t ticket[32]; uint64_t size; uint64_t hash; };
+struct rpc_msg_peer_pull_req {
+    rpc_tensor tensor;
+    rpc_msg_peer_export_rsp snapshot;
+    char host[64];
+    uint32_t port;
+};
+#endif
 #pragma pack(pop)
+
+#ifdef GGML_RPC_QUIC
+static constexpr size_t RPC_QUIC_CHUNK = 4 * 1024 * 1024;
+static constexpr size_t RPC_QUIC_MAX_MESSAGE = 64 * 1024 * 1024;
+static hoshino_rpc::peer_exports peer_snapshots;
+static std::atomic<uint64_t> peer_owner_sequence{1};
+#endif
 
 // RPC data structures
 
@@ -282,6 +304,9 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
     if (!sock->recv_data(&size, sizeof(size))) {
         return false;
     }
+#ifdef GGML_RPC_QUIC
+    if (size > RPC_QUIC_MAX_MESSAGE) return false;
+#endif
     try {
         input.resize(size);
     } catch (const std::bad_alloc & e) {
@@ -725,6 +750,18 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     const uint64_t profile_start = profile_activation ? ggml_stage_profile::monotonic_ns() : 0;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     uint8_t cache_flag = 0;
+#ifdef GGML_RPC_QUIC
+    // Chunk weights/activations so neither endpoint materializes an entire large tensor.
+    // The old whole-tensor hash cache is deliberately disabled for this transport.
+    for (size_t done = 0; done < size;) {
+        size_t count = std::min(size - done, RPC_QUIC_CHUNK);
+        size_t input_size;
+        auto input = serialize_set_tensor(rpc_tensor, 0, offset + done,
+                static_cast<const uint8_t *>(data) + done, count, input_size);
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+        done += count;
+    }
+#else
     if (rpc_use_hash_cache(tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
@@ -742,6 +779,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     size_t input_size;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+#endif
     if (profile_activation) {
         auto * type_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
         std::ostringstream fields;
@@ -763,7 +801,18 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
+#ifdef GGML_RPC_QUIC
+    for (size_t done = 0; done < size;) {
+        const size_t count = std::min(size - done, RPC_QUIC_CHUNK);
+        auto chunk = std::make_shared<rpc_msg_get_tensor_req>(*request);
+        chunk->offset = offset + done;
+        chunk->size = count;
+        ctx->dispatcher->send(RPC_CMD_GET_TENSOR, chunk, sizeof(*chunk), static_cast<uint8_t *>(data) + done, count);
+        done += count;
+    }
+#else
     ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+#endif
     if (profile_activation) {
         auto * type_ctx = (ggml_backend_rpc_buffer_type_context *)buffer->buft->context;
         std::ostringstream fields;
@@ -784,7 +833,37 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
         if (src_ctx->dispatcher != dst_ctx->dispatcher) {
+#ifdef GGML_RPC_QUIC
+            // Empty scheduler boundaries carry no bytes. Do not create a peer
+            // snapshot: the peer wire protocol deliberately rejects empty tickets.
+            if (ggml_nbytes(src) == 0) {
+                return ggml_nbytes(dst) == 0 && ggml_are_same_layout(src, dst);
+            }
+            // Export runs after all preceding source graph work on its ordered dispatcher.
+            // The destination pulls the immutable snapshot directly from the source peer.
+            auto source = std::make_shared<rpc_msg_peer_export_req>();
+            source->tensor = serialize_tensor(src);
+            rpc_msg_peer_export_rsp snapshot{};
+            GGML_ASSERT(ggml_nbytes(src) <= hoshino_rpc::peer_exports::max_tensor);
+            src_ctx->dispatcher->send(RPC_CMD_PEER_EXPORT, source, sizeof(*source), &snapshot, sizeof(snapshot));
+            GGML_ASSERT(snapshot.size == ggml_nbytes(src));
+            auto pull = std::make_shared<rpc_msg_peer_pull_req>();
+            pull->tensor = serialize_tensor(dst);
+            pull->snapshot = snapshot;
+            auto buft_ctx = static_cast<ggml_backend_rpc_buffer_type_context *>(src_buffer->buft->context);
+            std::string host;
+            int port;
+            GGML_ASSERT(parse_endpoint(buft_ctx->endpoint, host, port) && port > 0 && port < 65535 && host.size() < sizeof(pull->host));
+            memset(pull->host, 0, sizeof(pull->host));
+            memcpy(pull->host, host.data(), host.size());
+            pull->port = port + 1;
+            rpc_msg_copy_tensor_rsp response{};
+            dst_ctx->dispatcher->send(RPC_CMD_PEER_PULL, pull, sizeof(*pull), &response, sizeof(response));
+            RPC_STATUS_ASSERT(response.result == 1); // Never silently relay via coordinator on failure.
+            return true;
+#else
             return false;
+#endif
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         auto request = std::make_shared<rpc_msg_copy_tensor_req>();
@@ -980,6 +1059,10 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     uint8_t cache_flag = 0;
+#ifdef GGML_RPC_QUIC
+    ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+    return;
+#endif
     if (rpc_use_hash_cache(tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
@@ -1006,7 +1089,13 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
+#ifdef GGML_RPC_QUIC
+    ggml_backend_rpc_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
+    return;
+#else
+
     ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+#endif
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -1184,6 +1273,10 @@ public:
         stored_graphs.resize(backends.size());
     }
     ~rpc_server();
+#ifdef GGML_RPC_QUIC
+    bool peer_export(const rpc_msg_peer_export_req & request, rpc_msg_peer_export_rsp & response);
+    bool peer_pull(const rpc_msg_peer_pull_req & request, rpc_msg_copy_tensor_rsp & response);
+#endif
 
     void hello(rpc_msg_hello_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
@@ -1217,6 +1310,10 @@ private:
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
 
 
+#ifdef GGML_RPC_QUIC
+    uint64_t peer_owner = peer_owner_sequence.fetch_add(1);
+    std::unordered_map<std::string, socket_ptr> peer_connections;
+#endif
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
@@ -1885,7 +1982,96 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+#ifdef GGML_RPC_QUIC
+bool rpc_server::peer_export(const rpc_msg_peer_export_req & request, rpc_msg_peer_export_rsp & response) {
+    auto reject = [&](const char * reason, size_t size, bool size_known) {
+        char name[sizeof(request.tensor.name) + 1] = {};
+        for (size_t i = 0; i < sizeof(request.tensor.name) && request.tensor.name[i]; ++i) {
+            const unsigned char c = static_cast<unsigned char>(request.tensor.name[i]);
+            name[i] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' ? c : '_';
+        }
+        GGML_LOG_ERROR("[peer_export] rejected reason=%s tensor=%s type=%u ne=%u,%u,%u,%u nb=%u,%u,%u,%u nbytes=%zu known=%d\n",
+                       reason, name, request.tensor.type,
+                       request.tensor.ne[0], request.tensor.ne[1], request.tensor.ne[2], request.tensor.ne[3],
+                       request.tensor.nb[0], request.tensor.nb[1], request.tensor.nb[2], request.tensor.nb[3],
+                       size, size_known ? 1 : 0);
+        return false;
+    };
+    ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
+    ggml_context_ptr ctx{ggml_init(params)};
+    if (!ctx) return reject("context_init", 0, false);
+    auto tensor = deserialize_tensor(ctx.get(), &request.tensor);
+    if (!tensor || !tensor->buffer) return reject("deserialize_or_buffer", 0, false);
+    const size_t size = ggml_nbytes(tensor);
+    if (!size || size > hoshino_rpc::peer_exports::max_tensor) return reject("size_guard", size, true);
+    const bool profile = ggml_stage_profile::enabled();
+    const auto begin = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    std::vector<uint8_t> data(size);
+    ggml_backend_tensor_get(tensor, data.data(), 0, size);
+    const auto got = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    response.size = size;
+    response.hash = fnv_hash(data.data(), data.size());
+    const auto hashed = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    hoshino_rpc::ticket key;
+    if (!peer_snapshots.publish(peer_owner, std::move(data), key)) return reject("snapshot_capacity", size, true);
+    memcpy(response.ticket, key.data(), key.size());
+    if (profile) {
+        std::ostringstream fields;
+        fields << "\"payload_bytes\":" << size
+               << ",\"host_get_and_allocation_wall_ns\":" << got - begin
+               << ",\"checksum_wall_ns\":" << hashed - got
+               << ",\"snapshot_publish_wall_ns\":" << ggml_stage_profile::monotonic_ns() - hashed;
+        ggml_stage_profile::emit("rpc_peer_export", fields.str());
+    }
+    LOG_DBG("[peer_export] snapshot bytes=%zu\n", size);
+    return true;
+}
+
+bool rpc_server::peer_pull(const rpc_msg_peer_pull_req & request, rpc_msg_copy_tensor_rsp & response) {
+    if (request.host[sizeof(request.host)-1] || !request.host[0] || request.port < 1 || request.port > 65535 ||
+        !request.snapshot.size || request.snapshot.size > hoshino_rpc::peer_exports::max_tensor) return false;
+    ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
+    ggml_context_ptr ctx{ggml_init(params)};
+    if (!ctx) return false;
+    auto tensor = deserialize_tensor(ctx.get(), &request.tensor);
+    if (!tensor || !tensor->buffer || ggml_nbytes(tensor) != request.snapshot.size) return false;
+    std::string endpoint = std::string(request.host) + ":" + std::to_string(request.port);
+    if (!peer_connections.count(endpoint) && peer_connections.size() >= GGML_RPC_MAX_SERVERS) return false;
+    const bool profile = ggml_stage_profile::enabled();
+    const auto begin = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    auto & peer = peer_connections[endpoint];
+    if (!peer) peer = socket_t::connect(request.host, request.port);
+    if (!peer || !peer->send_data(&request.snapshot, sizeof(request.snapshot)) || !peer->flush()) return false;
+    std::vector<uint8_t> data(request.snapshot.size);
+    if (!peer->recv_data(data.data(), data.size())) return false;
+    const auto received = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    if (fnv_hash(data.data(), data.size()) != request.snapshot.hash) return false;
+    const auto hashed = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+    const auto set = profile ? ggml_stage_profile::monotonic_ns() : 0;
+    const uint8_t ack = 1;
+    if (!peer->send_data(&ack, 1) || !peer->flush()) return false;
+    response.result = 1;
+    if (profile) {
+        std::ostringstream fields;
+        fields << "\"payload_bytes\":" << data.size()
+               << ",\"source_endpoint\":" << ggml_stage_profile::quote(endpoint.c_str())
+               << ",\"connect_request_receive_wall_ns\":" << received - begin
+               << ",\"checksum_wall_ns\":" << hashed - received
+               << ",\"host_set_wall_ns\":" << set - hashed
+               << ",\"ack_submit_wall_ns\":" << ggml_stage_profile::monotonic_ns() - set;
+        ggml_stage_profile::emit("rpc_peer_pull", fields.str());
+    }
+    LOG_DBG("[peer_pull] source=%s bytes=%zu\n", endpoint.c_str(), data.size());
+    return true;
+}
+#endif
+
 rpc_server::~rpc_server() {
+#ifdef GGML_RPC_QUIC
+    peer_snapshots.clear_owner(peer_owner);
+#endif
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -1931,6 +2117,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     while (true) {
+#ifdef GGML_RPC_QUIC
+        if (!sock->wait_readable()) break;
+#endif
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
@@ -1940,6 +2129,22 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             break;
         }
         switch (cmd) {
+#ifdef GGML_RPC_QUIC
+            case RPC_CMD_PEER_EXPORT: {
+                rpc_msg_peer_export_req request;
+                rpc_msg_peer_export_rsp response{};
+                if (!recv_msg(sock, &request, sizeof(request)) || !server.peer_export(request, response) ||
+                    !send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_PEER_PULL: {
+                rpc_msg_peer_pull_req request;
+                rpc_msg_copy_tensor_rsp response{};
+                if (!recv_msg(sock, &request, sizeof(request)) || !server.peer_pull(request, response) ||
+                    !send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+#endif
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
                 return;
@@ -2159,6 +2364,53 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+#ifdef GGML_RPC_QUIC
+class rpc_peer_service {
+public:
+    rpc_peer_service(const char * host, int port) : listener(socket_t::create_server(host, port)) {
+        if (listener) thread = std::thread([this] { run(); });
+    }
+    ~rpc_peer_service() {
+        stopping = true;
+        if (listener) listener->close();
+        socket_ptr active;
+        { std::lock_guard<std::mutex> lock(mutex); active = current; }
+        if (active) active->close();
+        if (thread.joinable()) thread.join();
+    }
+    bool valid() const { return listener != nullptr; }
+private:
+    void run() {
+        while (!stopping) {
+            auto peer = listener->accept();
+            if (!peer) return;
+            { std::lock_guard<std::mutex> lock(mutex); current = peer; }
+            if (stopping) { peer->close(); return; }
+            for (;;) {
+                rpc_msg_peer_export_rsp requested{};
+#ifdef GGML_RPC_QUIC
+                if (!peer->wait_readable()) break;
+#endif
+                if (!peer->recv_data(&requested, sizeof(requested))) break;
+                hoshino_rpc::ticket key;
+                memcpy(key.data(), requested.ticket, key.size());
+                std::vector<uint8_t> data;
+                if (!peer_snapshots.take(key, requested.size, data) || fnv_hash(data.data(), data.size()) != requested.hash) break;
+                if (!peer->send_data(data.data(), data.size()) || !peer->flush()) break;
+                uint8_t ack = 0;
+                if (!peer->recv_data(&ack, 1) || ack != 1) break;
+            }
+            peer->close();
+            { std::lock_guard<std::mutex> lock(mutex); current.reset(); }
+        }
+    }
+    socket_ptr listener, current;
+    std::atomic<bool> stopping{false};
+    std::mutex mutex;
+    std::thread thread;
+};
+#endif
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
@@ -2200,7 +2452,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         return;
     }
 
-#ifdef GGML_RPC_RDMA
+#if defined(GGML_RPC_QUIC)
+    printf("  transport      : QUIC/UDP with direct peer snapshots (no TCP fallback)\n");
+#elif defined(GGML_RPC_RDMA)
     printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
 #else
     printf("  transport      : TCP\n");
@@ -2214,6 +2468,12 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+#ifdef GGML_RPC_QUIC
+    // Separate listener avoids deadlock with the single coordinator RPC dispatch loop.
+    if (port < 1 || port >= 65535) return;
+    rpc_peer_service peer_service(host.c_str(), port + 1);
+    if (!peer_service.valid()) { GGML_LOG_ERROR("Cannot bind direct peer listener\n"); return; }
+#endif
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {

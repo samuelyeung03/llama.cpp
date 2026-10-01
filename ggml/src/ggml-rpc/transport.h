@@ -19,6 +19,10 @@ struct socket_t {
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
+#ifdef GGML_RPC_QUIC
+    void close(); // Cancels blocked QUIC accept/send/receive for owned shutdown.
+    bool drain_acked(); // Bounded wait for queued data and QUIC retransmission backlog.
+#endif
 
     socket_ptr accept();
 

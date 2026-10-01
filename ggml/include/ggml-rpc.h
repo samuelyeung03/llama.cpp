@@ -6,7 +6,11 @@
 extern "C" {
 #endif
 
+#ifdef GGML_RPC_QUIC
+#define RPC_PROTO_MAJOR_VERSION    8 // isolated direct-UDP protocol; incompatible with upstream TCP
+#else
 #define RPC_PROTO_MAJOR_VERSION    7
+#endif
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
