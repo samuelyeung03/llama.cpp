@@ -4,6 +4,24 @@
 #include <cstdint>
 #include <memory>
 
+#ifdef GGML_RPC_QUIC
+struct rpc_quic_stats_t {
+    uint64_t udp_sent_engine = 0;
+    uint64_t udp_received_engine = 0;
+    uint64_t app_sent = 0;
+    uint64_t app_received = 0;
+    uint64_t udp_send_drops_engine = 0;
+    uint64_t udp_parse_errors_engine = 0;
+    uint32_t socket_receive_buffer = 0;
+    uint32_t socket_send_buffer = 0;
+    uint16_t local_port = 0;
+    uint16_t peer_port = 0;
+    uint32_t failed = 0;
+    char local_ipv4[16] = {};
+    char peer_ipv4[16] = {};
+};
+#endif
+
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
 
@@ -20,9 +38,11 @@ struct socket_t {
     // here. No-op on TCP.
     bool flush();
 #ifdef GGML_RPC_QUIC
-    void close(); // Cancels blocked QUIC accept/send/receive for owned shutdown.
+    void close(); // Graceful close; cancels blocked application I/O.
+    void shutdown(); // Abort owned I/O without waiting for peer FIN.
     bool drain_acked(); // Bounded wait for queued data and QUIC retransmission backlog.
     bool wait_readable(); // Between complete RPC messages only; payload reads remain timed.
+    bool get_quic_stats(rpc_quic_stats_t * stats); // UDP counters cover the shared engine.
 #endif
 
     socket_ptr accept();

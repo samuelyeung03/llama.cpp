@@ -86,6 +86,7 @@ struct channel_t {
     ring_t rx;
     bool ready = false;
     bool failed = false;
+    bool aborted = false;
     bool accepted = false;
     bool flow_manual = false;
     bool flow_update = false;
@@ -114,6 +115,7 @@ struct engine_t : std::enable_shared_from_this<engine_t> {
     int timeout_ms = IO_TIMEOUT_MS;
     int idle_timeout_ms = 600000;
     std::string cc;
+    std::string alpn = ALPN;
     std::string stats_dir;
     std::string qlog_dir;
     uint64_t wire_sent = 0;
@@ -183,7 +185,12 @@ struct engine_t : std::enable_shared_from_this<engine_t> {
             if (!end || *end || value < 1000 || value > 600000) return false;
             idle_timeout_ms = static_cast<int>(value);
         }
-        quic = picoquic_create(4, cert, key, ca, ALPN, &engine_t::callback,
+        if (const char * value = std::getenv("GGML_RPC_QUIC_ALPN")) {
+            const size_t length = std::strlen(value);
+            if (length == 0 || length > 255) return false;
+            alpn.assign(value, length);
+        }
+        quic = picoquic_create(4, cert, key, ca, alpn.c_str(), &engine_t::callback,
                               this, nullptr, nullptr, nullptr, now_us(), nullptr,
                               nullptr, nullptr, 0);
         if (!quic) { GGML_LOG_ERROR("picoquic_create failed\n"); return false; }
@@ -434,7 +441,7 @@ struct engine_t : std::enable_shared_from_this<engine_t> {
 };
 
 bool resolve_numeric(const char * host, int port, sockaddr_storage & out, socklen_t & len) {
-    if (!host || port < 1 || port > 65535) return false;
+    if (!host || port < 0 || port > 65535) return false;
     addrinfo hints = {};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
@@ -464,6 +471,7 @@ void socket_t::close() {
     if (!pimpl || !pimpl->engine) return;
     auto & e = *pimpl->engine;
     std::unique_lock<std::mutex> lock(e.mu);
+    if (e.stopping || (pimpl->channel && pimpl->channel->aborted)) return;
     if (pimpl->listener) {
         for (auto & kv : e.channels) {
             kv.second->closing = true;
@@ -477,7 +485,7 @@ void socket_t::close() {
     e.cv.notify_all();
     e.wake();
     if (pimpl->channel) e.cv.wait_for(lock, std::chrono::seconds(12), [&]() {
-        return pimpl->channel->close_sent || e.stopping || !pimpl->channel->cnx;
+        return pimpl->channel->close_sent || pimpl->channel->aborted || e.stopping || !pimpl->channel->cnx;
     });
     if (pimpl->listener) {
         e.cv.wait_for(lock, std::chrono::seconds(2), [&]() {
@@ -487,6 +495,28 @@ void socket_t::close() {
         e.stopping = true;
         e.wake();
     }
+}
+
+
+void socket_t::shutdown() {
+    if (!pimpl || !pimpl->engine) return;
+    auto & e = *pimpl->engine;
+    std::lock_guard<std::mutex> lock(e.mu);
+    auto abort_channel = [](channel_t & ch) {
+        ch.aborted = true;
+        ch.failed = true;
+        ch.closing = true;
+        if (!ch.close_started_us) ch.close_started_us = now_us();
+        if (ch.cnx && !ch.close_sent && picoquic_close(ch.cnx, 0x4833) == 0) ch.close_sent = true;
+    };
+    if (pimpl->listener) {
+        for (auto & kv : e.channels) abort_channel(*kv.second);
+        e.stopping = true;
+    } else if (pimpl->channel) {
+        abort_channel(*pimpl->channel);
+    }
+    e.cv.notify_all();
+    e.wake();
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
@@ -500,12 +530,14 @@ socket_ptr socket_t::create_server(const char * host, int port) {
         bind(e->fd, reinterpret_cast<sockaddr *>(&addr), len) != 0) {
         GGML_LOG_ERROR("QUIC UDP bind failed: %s\n", strerror(errno)); return nullptr;
     }
-    e->local = addr;
+    socklen_t actual_length = sizeof(e->local);
+    if (getsockname(e->fd, reinterpret_cast<sockaddr *>(&e->local), &actual_length) != 0) return nullptr;
     e->start();
     return socket_ptr(new socket_t(std::unique_ptr<impl>(new impl(e, nullptr, true))));
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
+    if (port < 1 || port > 65535) return nullptr;
     sockaddr_storage addr = {};
     socklen_t len = 0;
     if (!resolve_numeric(host, port, addr, len)) return nullptr;
@@ -526,7 +558,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
     const char * sni = std::getenv("GGML_RPC_QUIC_SNI");
     if (!sni || !*sni) sni = DEFAULT_SNI;
     auto * cnx = picoquic_create_client_cnx(e->quic, reinterpret_cast<sockaddr *>(&addr), now_us(),
-                                             0, sni, ALPN, &engine_t::callback, e.get());
+                                             0, sni, e->alpn.c_str(), &engine_t::callback, e.get());
     if (!cnx) return nullptr;
     auto ch = std::make_shared<channel_t>(); ch->cnx = cnx;
     ch->id = e->next_id++;
@@ -618,6 +650,43 @@ bool socket_t::drain_acked() {
     return e.cv.wait_for(lock, std::chrono::milliseconds(e.timeout_ms), [&]() {
         return ch.acked_empty || ch.failed || ch.closing || e.stopping;
     }) && !ch.failed && !ch.closing && !e.stopping;
+}
+bool socket_t::get_quic_stats(rpc_quic_stats_t * stats) {
+    if (!stats || !pimpl || !pimpl->engine) return false;
+    auto & e = *pimpl->engine;
+    std::lock_guard<std::mutex> lock(e.mu);
+    *stats = {};
+    stats->udp_sent_engine = e.wire_sent;
+    stats->udp_received_engine = e.wire_received;
+    stats->udp_send_drops_engine = e.udp_send_drops;
+    stats->udp_parse_errors_engine = e.udp_parse_errors;
+    stats->socket_receive_buffer = static_cast<uint32_t>(e.socket_receive_buffer);
+    stats->socket_send_buffer = static_cast<uint32_t>(e.socket_send_buffer);
+    stats->failed = e.stopping ? 1 : 0;
+    sockaddr_storage local = e.local;
+    sockaddr * peer = nullptr;
+    if (pimpl->channel) {
+        auto & ch = *pimpl->channel;
+        stats->app_sent = ch.app_sent;
+        stats->app_received = ch.app_received;
+        stats->failed = stats->failed || ch.failed;
+        if (ch.cnx) {
+            picoquic_get_peer_addr(ch.cnx, &peer);
+            sockaddr_storage path_local = {};
+            if (picoquic_get_path_addr(ch.cnx, 0, 1, &path_local) == 0 && path_local.ss_family == AF_INET) local = path_local;
+        }
+    }
+    if (local.ss_family == AF_INET) {
+        const auto * address = reinterpret_cast<const sockaddr_in *>(&local);
+        (void)inet_ntop(AF_INET, &address->sin_addr, stats->local_ipv4, sizeof(stats->local_ipv4));
+        stats->local_port = ntohs(address->sin_port);
+    }
+    if (peer && peer->sa_family == AF_INET) {
+        const auto * address = reinterpret_cast<const sockaddr_in *>(peer);
+        (void)inet_ntop(AF_INET, &address->sin_addr, stats->peer_ipv4, sizeof(stats->peer_ipv4));
+        stats->peer_port = ntohs(address->sin_port);
+    }
+    return true;
 }
 void socket_t::get_caps(uint8_t * caps) { memset(caps, 0, RPC_CONN_CAPS_SIZE); }
 void socket_t::update_caps(const uint8_t *) {}
